@@ -1,0 +1,2 @@
+#!/bin/sh
+exec multilog t s250000 n4 /var/log/dbus-bms-switcher
