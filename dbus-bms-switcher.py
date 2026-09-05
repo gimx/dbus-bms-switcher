@@ -17,9 +17,9 @@ BMS_CONFIG_B = "/data/vds/dbus-serialbattery/config.daly.ini"
 BMS_TARGET = "/data/vds/dbus-serialbattery/config.ini"
 
 SERVICE_A = "/service/dbus-canbattery.can0"
-SERVICE_B = "/service/dbus-serialbattery.ttyUSB1"
+SERVICE_B = "/service/dbus-serialbattery.ttyUSB0"
 
-SERIAL_DBUS_SERVICE = "com.victronenergy.battery.ttyUSB1"
+SERIAL_DBUS_SERVICE = "com.victronenergy.battery.ttyUSB0"
 CAN_DBUS_SERVICE = "com.victronenergy.battery.can0"
 
 SCRIPT_DIR = "/data/vds/dbus-serialbattery"
@@ -34,7 +34,10 @@ class BmsSwitcherService(dbus.service.Object):
         super().__init__(bus_name, "/Settings/BmsSwitcher")
         
         self.is_busy = False
-        logging.info("BMS Switcher Python D-Bus daemon initialized.")
+        
+        # Start SOC periodic monitor loop (checks every 10 seconds)
+        GLib.timeout_add_seconds(10, self._check_soc_thresholds)
+        logging.info("BMS Switcher Python D-Bus daemon initialized with SOC monitoring.")
 
     @dbus.service.method("com.victronenergy.bmsswitcher", in_signature='i', out_signature='b')
     def TriggerSwitch(self, val):
@@ -70,6 +73,45 @@ class BmsSwitcherService(dbus.service.Object):
             if str(name).startswith("com.victronenergy.vebus"):
                 return str(name)
         return None
+
+    def _check_soc_thresholds(self):
+        """Monitors system SOC and triggers switchover based on charge/discharge conditions."""
+        if self.is_busy:
+            return True  # Skip check while a switch is currently active
+
+        soc = self._get_dbus_value("com.victronenergy.system", "/Dc/Soc")
+        soc_limit = self._get_dbus_value("com.victronenergy.system", "/Control/ActiveSocLimit")
+        battery_power = self._get_dbus_value("com.victronenergy.system", "/Dc/Battery/Power")
+
+        if soc is None or battery_power is None:
+            return True
+
+        try:
+            soc_val = float(soc)
+            power_val = float(battery_power)
+
+            # DISCHARGING CONDITION (Negative Power)
+            if power_val < -10 and soc_limit is not None:
+                target_limit = float(soc_limit) + 5.0
+                if soc_val <= target_limit:
+                    logging.info(
+                        f"Auto-switch triggered (Discharging): Current SOC ({soc_val:.1f}%) "
+                        f"reached threshold ({target_limit:.1f}% = Limit {soc_limit}% + 5%)."
+                    )
+                    self.TriggerSwitch(1)
+
+            # CHARGING CONDITION (Positive Power)
+            elif power_val > 10 and soc_val >= 85.0:
+                logging.info(
+                    f"Auto-switch triggered (Charging): Current SOC ({soc_val:.1f}%) "
+                    f"reached 85% threshold."
+                )
+                self.TriggerSwitch(1)
+
+        except Exception as e:
+            logging.error(f"Error processing SOC threshold logic: {e}")
+
+        return True  # Returning True keeps the GLib timer alive
 
     def _execute_switch_process(self):
         self.is_busy = True
