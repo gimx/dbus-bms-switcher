@@ -35,9 +35,14 @@ class BmsSwitcherService(dbus.service.Object):
         
         self.is_busy = False
         
+        # --- Flip-Flop Prevention Tracking ---
+        self.last_auto_switch_reason = None  # Tracks "LOW_SOC" or "HIGH_SOC"
+        self.last_auto_switch_time = 0
+        self.COOLDOWN_SECONDS = 900          # 15-minute minimum cooldown between auto-switches
+        
         # Start SOC periodic monitor loop (checks every 10 seconds)
         GLib.timeout_add_seconds(10, self._check_soc_thresholds)
-        logging.info("BMS Switcher Python D-Bus daemon initialized with SOC monitoring.")
+        logging.info("BMS Switcher Python D-Bus daemon initialized with SOC anti-flip-flop protection.")
 
     @dbus.service.method("com.victronenergy.bmsswitcher", in_signature='i', out_signature='b')
     def TriggerSwitch(self, val):
@@ -75,9 +80,9 @@ class BmsSwitcherService(dbus.service.Object):
         return None
 
     def _check_soc_thresholds(self):
-        """Monitors system SOC and triggers switchover based on charge/discharge conditions."""
+        """Monitors SOC and prevents continuous switchover loops when both batteries are low/high."""
         if self.is_busy:
-            return True  # Skip check while a switch is currently active
+            return True
 
         soc = self._get_dbus_value("com.victronenergy.system", "/Dc/Soc")
         soc_limit = self._get_dbus_value("com.victronenergy.system", "/Control/ActiveSocLimit")
@@ -89,29 +94,61 @@ class BmsSwitcherService(dbus.service.Object):
         try:
             soc_val = float(soc)
             power_val = float(battery_power)
+            now = time.time()
 
-            # DISCHARGING CONDITION (Negative Power)
+            # --- HYSTERESIS RESETS ---
+            # Reset LOW_SOC lock once the active battery charges above limit + 10%
+            if self.last_auto_switch_reason == "LOW_SOC" and soc_limit is not None:
+                if soc_val > (float(soc_limit) + 10.0):
+                    logging.info("SOC recovered above limit + 10%. Clearing LOW_SOC switch lock.")
+                    self.last_auto_switch_reason = None
+
+            # Reset HIGH_SOC lock once the active battery discharges below 80%
+            if self.last_auto_switch_reason == "HIGH_SOC" and soc_val < 80.0:
+                logging.info("SOC dropped below 80%. Clearing HIGH_SOC switch lock.")
+                self.last_auto_switch_reason = None
+
+            # Enforce global cooldown period
+            if (now - self.last_auto_switch_time) < self.COOLDOWN_SECONDS:
+                return True
+
+            # --- DISCHARGING LOGIC ---
             if power_val < -10 and soc_limit is not None:
                 target_limit = float(soc_limit) + 5.0
                 if soc_val <= target_limit:
-                    logging.info(
-                        f"Auto-switch triggered (Discharging): Current SOC ({soc_val:.1f}%) "
-                        f"reached threshold ({target_limit:.1f}% = Limit {soc_limit}% + 5%)."
-                    )
-                    self.TriggerSwitch(1)
+                    if self.last_auto_switch_reason == "LOW_SOC":
+                        logging.warning(
+                            f"Both battery banks are low (SOC {soc_val:.1f}% <= threshold {target_limit:.1f}%). "
+                            "Preventing continuous switch loop."
+                        )
+                    else:
+                        logging.info(
+                            f"Auto-switch triggered (Discharging): SOC ({soc_val:.1f}%) "
+                            f"reached threshold ({target_limit:.1f}%)."
+                        )
+                        self.last_auto_switch_reason = "LOW_SOC"
+                        self.last_auto_switch_time = now
+                        self.TriggerSwitch(1)
 
-            # CHARGING CONDITION (Positive Power)
+            # --- CHARGING LOGIC ---
             elif power_val > 10 and soc_val >= 85.0:
-                logging.info(
-                    f"Auto-switch triggered (Charging): Current SOC ({soc_val:.1f}%) "
-                    f"reached 85% threshold."
-                )
-                self.TriggerSwitch(1)
+                if self.last_auto_switch_reason == "HIGH_SOC":
+                    logging.warning(
+                        f"Both battery banks are full (SOC {soc_val:.1f}% >= 85%). "
+                        "Preventing continuous switch loop."
+                    )
+                else:
+                    logging.info(
+                        f"Auto-switch triggered (Charging): SOC ({soc_val:.1f}%) reached 85%."
+                    )
+                    self.last_auto_switch_reason = "HIGH_SOC"
+                    self.last_auto_switch_time = now
+                    self.TriggerSwitch(1)
 
         except Exception as e:
             logging.error(f"Error processing SOC threshold logic: {e}")
 
-        return True  # Returning True keeps the GLib timer alive
+        return True
 
     def _execute_switch_process(self):
         self.is_busy = True
