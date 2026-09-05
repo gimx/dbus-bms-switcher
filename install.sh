@@ -1,6 +1,5 @@
 #!/bin/bash
 
-# Define paths and directories
 SCRIPT_DIR=$(cd $(dirname $0) && pwd)
 DATA_DIR="/data/dbus-bms-switcher"
 SERVICE_DIR="/service/dbus-bms-switcher"
@@ -24,23 +23,29 @@ fi
 if [ $mode == 0 ]; then
     echo "Do install"
 
-    # 1. Copy files to /data/dbus-bms-switcher
-    echo "Deploying application files..."
+    # 1. Stop service if already running during re-install
+    if [ -d "$SERVICE_DIR" ] || [ -L "$SERVICE_DIR" ]; then
+        svc -d $SERVICE_DIR $SERVICE_DIR/log 2>/dev/null
+    fi
+
+    # 2. Create destination directories
     mkdir -p $DATA_DIR
-    cp -rf $SCRIPT_DIR/* $DATA_DIR/
-    chmod +x $DATA_DIR/dbus-bms-switcher.py
-    chmod +x $DATA_DIR/service/run
-
-    # 2. Setup logging directory and log runner
     mkdir -p $LOG_DIR
-    mkdir -p $DATA_DIR/service/log
-    cat << 'EOF' > $DATA_DIR/service/log/run
-#!/bin/sh
-exec multilog t s250000 n4 /var/log/dbus-bms-switcher
-EOF
-    chmod +x $DATA_DIR/service/log/run
 
-    # 3. Handle QML GUI Integration
+    # 3. Copy application files and existing service structure directly
+    echo "Deploying application and existing service files..."
+    cp -rf $SCRIPT_DIR/* $DATA_DIR/
+
+    # 4. Ensure existing run scripts and python executable have proper permissions
+    chmod +x $DATA_DIR/dbus-bms-switcher.py
+    if [ -f "$DATA_DIR/service/run" ]; then
+        chmod +x $DATA_DIR/service/run
+    fi
+    if [ -f "$DATA_DIR/service/log/run" ]; then
+        chmod +x $DATA_DIR/service/log/run
+    fi
+
+    # 5. Handle QML GUI Integration
     if [ -f "$QML_DIR/PageSettings.qml" ]; then
         if grep -Fq "PageBmsSwitcher" $QML_DIR/PageSettings.qml; then
             echo "GUI menu already in PageSettings.qml"
@@ -53,13 +58,16 @@ EOF
         fi
     fi
 
-    # 4. Link service for daemontools
+    # 6. Link service directory to /service for daemontools
     if [ ! -d "$SERVICE_DIR" ] && [ ! -L "$SERVICE_DIR" ]; then
         echo "Linking service to /service..."
         ln -s $DATA_DIR/service $SERVICE_DIR
+    else
+        echo "Restarting active service..."
+        svc -u $SERVICE_DIR $SERVICE_DIR/log
     fi
 
-    # 5. Make service persistent across reboots via /data/rc.local
+    # 7. Make service persistent across reboots via /data/rc.local
     if [ -f /data/rc.local ] && grep -qxF "ln -s /data/dbus-bms-switcher/service /service/dbus-bms-switcher" /data/rc.local; then
         echo "Service persistence already configured in /data/rc.local"
     else
@@ -74,11 +82,11 @@ EOF
 else
     echo "Do uninstall"
 
-    # 1. Stop and remove daemontools service
+    # 1. Stop main service AND log supervisor cleanly
     if [ -d "$SERVICE_DIR" ] || [ -L "$SERVICE_DIR" ]; then
-        echo "Stopping and removing service..."
-        svc -d $SERVICE_DIR
-        svc -x $SERVICE_DIR
+        echo "Stopping service and log process..."
+        svc -d $SERVICE_DIR $SERVICE_DIR/log 2>/dev/null
+        svc -x $SERVICE_DIR $SERVICE_DIR/log 2>/dev/null
         rm -f $SERVICE_DIR
     fi
 
