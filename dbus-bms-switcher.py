@@ -250,7 +250,26 @@ class BmsSwitcherService(dbus.service.Object):
             else:
                 logging.error(f"Error: {ENABLE_CMD} not executable or missing.")
 
-            time.sleep(3)
+            # 9b. Restart serial-starter when switching to Serial BMS
+            if "serialbattery" in new_service:
+                logging.info("Restarting serial-starter service for Serial BMS...")
+                if os.path.exists("/service/serial-starter"):
+                    subprocess.run(["svc", "-t", "/service/serial-starter"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            # 9c. Post-Enable Hooks (Serial BMS: Re-enable Charge and Discharge)
+            if "serialbattery" in new_service:
+                logging.info(f"Waiting for Serial BMS ({SERIAL_DBUS_SERVICE}) to appear on D-Bus...")
+                # Poll for up to 15 seconds to allow serial-starter and driver to register
+                for _ in range(15):
+                    names = [str(n) for n in self.bus.list_names()]
+                    if SERIAL_DBUS_SERVICE in names:
+                        break
+                    time.sleep(1)
+
+                logging.info(f"Re-enabling Charge and Discharge for Serial BMS ({SERIAL_DBUS_SERVICE})...")
+                self._set_dbus_value(SERIAL_DBUS_SERVICE, "/Settings/ForceChargingOff", 0)
+                self._set_dbus_value(SERIAL_DBUS_SERVICE, "/Settings/ForceDischargingOff", 0)
+                logging.info("ForceChargingOff and ForceDischargingOff set to 0.")
 
             # 10. MultiPlus Power ON
             if vebus_service:
