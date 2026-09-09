@@ -12,9 +12,9 @@ from gi.repository import GLib
 logging.basicConfig(level=logging.INFO, format='[BMS-SWITCHER] %(asctime)s - %(message)s')
 
 # --- Path Configurations ---
-BMS_CONFIG_A = "/data/vds/dbus-serialbattery/config.ubms.ini"
-BMS_CONFIG_B = "/data/vds/dbus-serialbattery/config.daly.ini"
-BMS_TARGET = "/data/vds/dbus-serialbattery/config.ini"
+BMS_CONFIG_A = "/data/apps/dbus-serialbattery/config.ubms.ini"
+BMS_CONFIG_B = "/data/apps/dbus-serialbattery/config.daly.ini"
+BMS_TARGET = "/data/apps/dbus-serialbattery/config.ini"
 
 SERVICE_A = "/service/dbus-canbattery.can0"
 SERVICE_B = "/service/dbus-serialbattery.ttyUSB0"
@@ -179,36 +179,51 @@ class BmsSwitcherService(dbus.service.Object):
 
             if not active_bms_str:
                 logging.warning("No active BMS detected on DBus. Proceeding with switch anyway...")
-            elif active_bms_str != expected_bms:
+            elif expected_bms not in active_bms_str and active_bms_str not in expected_bms:
                 logging.error(f"Active BMS ({active_bms_str}) does not match preset ({expected_bms})! Aborting.")
                 return
             else:
                 logging.info(f"Active BMS verified: {active_bms_str}")
 
-            # 3. Wait up to 10 minutes for Consumption < 100W
-            logging.info("Waiting up to 10 minutes for L1 consumption to drop below 100W...")
-            timeout = 600
-            elapsed = 0
-            wait_interval = 5
+            # 3. Check MultiPlus Mode & Wait for Consumption < 100W
+            vebus_service = self._get_vebus_service()
+            vebus_mode = self._get_dbus_value(vebus_service, "/Mode") if vebus_service else None
+            vebus_state = self._get_dbus_value(vebus_service, "/State") if vebus_service else None
+ 
+            if vebus_mode == 4 or vebus_state == None:
+                logging.info("MultiPlus is already OFF. Skipping power consumption wait.")
+            else:
+                logging.info("Waiting up to 10 minutes for L1 consumption to drop below 100W...")
+                timeout = 600
+                elapsed = 0
+                wait_interval = 5
 
-            while elapsed < timeout:
-                power = self._get_dbus_value("com.victronenergy.system", "/Ac/ConsumptionOnOutput/L1/Power")
-                if power is not None:
-                    try:
-                        power_val = int(float(power))
-                        if power_val < 100:
-                            logging.info(f"Power has dropped to {power_val}W. Proceeding...")
-                            break
-                    except ValueError:
-                        pass
-                time.sleep(wait_interval)
-                elapsed += wait_interval
+                while elapsed < timeout:
+                    # Re-check mode in case MultiPlus was turned off manually during wait
+                    vebus_mode = self._get_dbus_value(vebus_service, "/Mode") if vebus_service else None
+                    if vebus_mode == 4:
+                        logging.info("MultiPlus switched to OFF during wait. Proceeding...")
+                        break
 
-            if elapsed >= timeout:
-                logging.warning("10-minute timeout reached. Proceeding anyway.")
+                    power = self._get_dbus_value("com.victronenergy.system", "/Ac/ConsumptionOnOutput/L1/Power")
+                    
+                    # Ensure power is not None or an empty dbus.Array before casting
+                    if power is not None and not isinstance(power, (dbus.Array, list, dict, tuple)):
+                        try:
+                            power_val = int(float(power))
+                            if power_val < 100:
+                                logging.info(f"Power has dropped to {power_val}W. Proceeding...")
+                                break
+                        except (ValueError, TypeError):
+                            pass
+
+                    time.sleep(wait_interval)
+                    elapsed += wait_interval
+
+                if elapsed >= timeout:
+                    logging.warning("10-minute timeout reached. Proceeding anyway.")
 
             # 4. MultiPlus Power OFF
-            vebus_service = self._get_vebus_service()
             if vebus_service:
                 self._set_dbus_value(vebus_service, "/Mode", 4)
                 logging.info(f"MultiPlus ({vebus_service}) set to OFF")
@@ -256,10 +271,9 @@ class BmsSwitcherService(dbus.service.Object):
                 if os.path.exists("/service/serial-starter"):
                     subprocess.run(["svc", "-t", "/service/serial-starter"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-            # 9c. Post-Enable Hooks (Serial BMS: Re-enable Charge and Discharge)
+            # 9c. Post-Enable Hooks (Serial BMS: Re-enable Charge/Discharge)
             if "serialbattery" in new_service:
                 logging.info(f"Waiting for Serial BMS ({SERIAL_DBUS_SERVICE}) to appear on D-Bus...")
-                # Poll for up to 15 seconds to allow serial-starter and driver to register
                 for _ in range(15):
                     names = [str(n) for n in self.bus.list_names()]
                     if SERIAL_DBUS_SERVICE in names:
@@ -269,7 +283,8 @@ class BmsSwitcherService(dbus.service.Object):
                 logging.info(f"Re-enabling Charge and Discharge for Serial BMS ({SERIAL_DBUS_SERVICE})...")
                 self._set_dbus_value(SERIAL_DBUS_SERVICE, "/Settings/ForceChargingOff", 0)
                 self._set_dbus_value(SERIAL_DBUS_SERVICE, "/Settings/ForceDischargingOff", 0)
-                logging.info("ForceChargingOff and ForceDischargingOff set to 0.")
+
+            time.sleep(3)
 
             # 10. MultiPlus Power ON
             if vebus_service:
