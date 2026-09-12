@@ -234,7 +234,6 @@ class BmsSwitcherService(dbus.service.Object):
                 if SERIAL_DBUS_SERVICE in names:
                     logging.info(f"Setting ForceCharge/Discharge Off for Serial BMS ({SERIAL_DBUS_SERVICE})...")
                     self._set_dbus_value(SERIAL_DBUS_SERVICE, "/Settings/ForceChargingOff", 1)
-                    self._set_dbus_value(SERIAL_DBUS_SERVICE, "/Settings/ForceDischargingOff", 1)
 
             # 6. Disable Current Service
             if os.access(DISABLE_CMD, os.X_OK):
@@ -282,7 +281,6 @@ class BmsSwitcherService(dbus.service.Object):
 
                 logging.info(f"Re-enabling Charge and Discharge for Serial BMS ({SERIAL_DBUS_SERVICE})...")
                 self._set_dbus_value(SERIAL_DBUS_SERVICE, "/Settings/ForceChargingOff", 0)
-                self._set_dbus_value(SERIAL_DBUS_SERVICE, "/Settings/ForceDischargingOff", 0)
 
             time.sleep(3)
 
