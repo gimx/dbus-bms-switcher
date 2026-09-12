@@ -64,7 +64,7 @@ if [ $mode == 0 ]; then
         ln -s $DATA_DIR/service $SERVICE_DIR
     else
         echo "Restarting active service..."
-        svc -u $SERVICE_DIR $SERVICE_DIR/log
+        svc -u $SERVICE_DIR
     fi
 
     # 7. Make service persistent across reboots via /data/rc.local
@@ -82,12 +82,12 @@ if [ $mode == 0 ]; then
 else
     echo "Do uninstall"
 
-    # 1. Stop main service AND log supervisor cleanly
+    # 1. Stop main service cleanly
     if [ -d "$SERVICE_DIR" ] || [ -L "$SERVICE_DIR" ]; then
-        echo "Stopping service and log process..."
-        svc -d $SERVICE_DIR $SERVICE_DIR/log 2>/dev/null
-        svc -x $SERVICE_DIR $SERVICE_DIR/log 2>/dev/null
-        rm -f $SERVICE_DIR
+        echo "Stopping service ..."
+        svc -d $SERVICE_DIR 2>/dev/null
+        svc -x $SERVICE_DIR 2>/dev/null
+        rm -rf $SERVICE_DIR
     fi
 
     # 2. Clean persistence entry from /data/rc.local
