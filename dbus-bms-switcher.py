@@ -23,6 +23,19 @@ SERVICE_A = "/service/dbus-canbattery.can0"
 SERVICE_B = "/service/dbus-serialbattery.ttyUSB0"
 
 
+def get_git_version():
+    """Executes git describe to fetch the current git tag/hash of the file directory."""
+    try:
+        script_dir = os.path.dirname(os.path.realpath(__file__))
+        return subprocess.check_output(
+            ["git", "describe", "--always", "--dirty"],
+            cwd=script_dir,
+            stderr=subprocess.DEVNULL
+        ).decode('utf-8').strip()
+    except Exception:
+        return "Unknown"
+
+
 class BmsSwitcherService:
     def __init__(self):
         # Read config using flat headerless template logic
@@ -54,8 +67,9 @@ class BmsSwitcherService:
         self._dbusservice = VeDbusService(SERVICE_NAME, self.bus, register=False)
 
         # Management & Mandatory D-Bus Objects
+        git_ver = get_git_version()
         self._dbusservice.add_path('/Mgmt/ProcessName', __file__)
-        self._dbusservice.add_path('/Mgmt/ProcessVersion', '1.0, running on Python ' + platform.python_version())
+        self._dbusservice.add_path('/Mgmt/ProcessVersion', f"{git_ver} (Python {platform.python_version()})")
         self._dbusservice.add_path('/Mgmt/Connection', 'Internal BMS Switcher Daemon')
         self._dbusservice.add_path('/DeviceInstance', 0)
         self._dbusservice.add_path('/ProductId', 0xFFFF)
@@ -63,13 +77,19 @@ class BmsSwitcherService:
         self._dbusservice.add_path('/CustomName', 'BMS Switcher')
         self._dbusservice.add_path('/Connected', 1)
 
-        # Exposed Settings & Switch Reason
-        self._dbusservice.add_path('/Settings/BmsSwitcher/MinSoc', self.min_soc if self.min_soc is not None else -1.0)
-        self._dbusservice.add_path('/Settings/BmsSwitcher/MaxSoc', self.max_soc)
-        self._dbusservice.add_path('/Settings/BmsSwitcher/SocLimitSource', self.soc_source)
-        self._dbusservice.add_path('/Settings/BmsSwitcher/LastSwitchReason', 'None', writeable=True)
+        # Settings
+        self._dbusservice.add_path('/Settings/BmsSwitcher/MinSoc', 
+                                   self.min_soc if self.min_soc is not None else -1.0, 
+                                   writeable=True, 
+                                   onchangecallback=self._handle_min_soc_change)
+        self._dbusservice.add_path('/Settings/BmsSwitcher/MaxSoc', 
+                                   self.max_soc, 
+                                   writeable=True, 
+                                   onchangecallback=self._handle_max_soc_change)
+        self._dbusservice.add_path('/Settings/BmsSwitcher/SocLimitSource', self.soc_source, writeable=True)
 
-        # Trigger Method callback hook
+        # Status & Control Paths (Non-settings)
+        self._dbusservice.add_path('/LastSwitchReason', 'None', writeable=True)
         self._dbusservice.add_path('/TriggerSwitch', 0, writeable=True, onchangecallback=self._handle_trigger_switch)
 
         # Operational state & anti-flip-flop tracking
@@ -83,7 +103,7 @@ class BmsSwitcherService:
 
         # Start periodic SOC monitoring loop (checks every 10 seconds)
         GLib.timeout_add_seconds(10, self._check_soc_thresholds)
-        logging.info(f"BMS Switcher service registered on D-Bus ({SERVICE_NAME}) with seamless AC pass-through switching.")
+        logging.info(f"BMS Switcher service registered on D-Bus ({SERVICE_NAME}) [Git Version: {git_ver}].")
 
     def _getConfig(self):
         config = configparser.ConfigParser()
@@ -102,6 +122,36 @@ class BmsSwitcherService:
             logging.info("No configuration file found. Using default paths and SOC limits.")
             
         return config
+
+    def _handle_min_soc_change(self, path, value):
+        """Callback executed when MinSoc is updated over D-Bus."""
+        try:
+            val = float(value)
+            if val < 0:
+                self.min_soc = None
+                logging.info("MinSoc set to dynamic mode (< 0) via D-Bus.")
+            else:
+                self.min_soc = val
+                logging.info(f"MinSoc updated via D-Bus to: {self.min_soc}%")
+
+            self._dbusservice['/Settings/BmsSwitcher/SocLimitSource'] = "D-Bus"
+            return True
+        except (ValueError, TypeError) as e:
+            logging.error(f"Invalid MinSoc value received: {value} ({e})")
+            return False
+
+    def _handle_max_soc_change(self, path, value):
+        """Callback executed when MaxSoc is updated over D-Bus."""
+        try:
+            val = float(value)
+            self.max_soc = val
+            logging.info(f"MaxSoc updated via D-Bus to: {self.max_soc}%")
+
+            self._dbusservice['/Settings/BmsSwitcher/SocLimitSource'] = "D-Bus"
+            return True
+        except (ValueError, TypeError) as e:
+            logging.error(f"Invalid MaxSoc value received: {value} ({e})")
+            return False
 
     def _handle_trigger_switch(self, path, value):
         if int(value) == 1:
@@ -196,7 +246,7 @@ class BmsSwitcherService:
                         logging.info(f"Auto-switch triggered (Discharging): {reason_msg}")
                         self.last_auto_switch_reason = "LOW_SOC"
                         self.last_auto_switch_time = now
-                        self._dbusservice['/Settings/BmsSwitcher/LastSwitchReason'] = reason_msg
+                        self._dbusservice['/LastSwitchReason'] = reason_msg
                         self._handle_trigger_switch('/TriggerSwitch', 1)
 
             # Charging Logic
@@ -208,7 +258,7 @@ class BmsSwitcherService:
                     logging.info(f"Auto-switch triggered (Charging): {reason_msg}")
                     self.last_auto_switch_reason = "HIGH_SOC"
                     self.last_auto_switch_time = now
-                    self._dbusservice['/Settings/BmsSwitcher/LastSwitchReason'] = reason_msg
+                    self._dbusservice['/LastSwitchReason'] = reason_msg
                     self._handle_trigger_switch('/TriggerSwitch', 1)
 
         except Exception as e:
@@ -236,10 +286,9 @@ class BmsSwitcherService:
             logging.info(f"Initiating seamless pass-through switch ({transition})...")
 
             if not self.last_auto_switch_time or (time.time() - self.last_auto_switch_time > 10):
-                self._dbusservice['/Settings/BmsSwitcher/LastSwitchReason'] = f"Manual Trigger ({transition})"
+                self._dbusservice['/LastSwitchReason'] = f"Manual Trigger ({transition})"
 
             # 1. Seamless AC Pass-Through Isolation
-            # Zero out DVCC Max Charge Current and halt active battery driver charge/discharge
             logging.info("Isolating DC Bus: Setting DVCC Max Charge Current to 0A...")
             self._set_dbus_value("com.victronenergy.settings", "/Settings/SystemSetup/MaxChargeCurrent", 0.0)
 
