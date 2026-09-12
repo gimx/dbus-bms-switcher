@@ -121,12 +121,11 @@ class BmsSwitcherService:
             return None
 
     def _set_dbus_value(self, service_name, path, value):
-        """Sets a D-Bus value with explicit type wrapping for Victron BusItem calls."""
+        """Sets a D-Bus value using explicit dbus types to ensure compatibility."""
         try:
             obj = self.bus.get_object(service_name, path)
             iface = dbus.Interface(obj, "com.victronenergy.BusItem")
             
-            # Wrap float/int explicitly as dbus.Double or dbus.Int32 to prevent DBus.Error.UnknownObject
             if isinstance(value, float):
                 dbus_val = dbus.Double(value)
             elif isinstance(value, int):
@@ -137,7 +136,7 @@ class BmsSwitcherService:
             iface.SetValue(dbus_val)
             return True
         except Exception as e:
-            logging.error(f"Failed to set {path} on {service_name}: {e}")
+            logging.warning(f"Could not set {path} on {service_name}: {e}")
             return False
 
     def _get_active_serial_battery_service(self):
@@ -239,33 +238,33 @@ class BmsSwitcherService:
             if not self.last_auto_switch_time or (time.time() - self.last_auto_switch_time > 10):
                 self._dbusservice['/Settings/BmsSwitcher/LastSwitchReason'] = f"Manual Trigger ({transition})"
 
-            # 1. Seamless AC Pass-Through Isolation (Set DVCC limits to 0A)
-            logging.info("Isolating DC Bus: Setting DVCC Max Charge & Discharge Current limits to 0A...")
+            # 1. Seamless AC Pass-Through Isolation
+            # Zero out DVCC Max Charge Current and halt active battery driver charge/discharge
+            logging.info("Isolating DC Bus: Setting DVCC Max Charge Current to 0A...")
             self._set_dbus_value("com.victronenergy.settings", "/Settings/SystemSetup/MaxChargeCurrent", 0.0)
-            self._set_dbus_value("com.victronenergy.settings", "/Settings/SystemSetup/MaxDischargeCurrent", 0.0)
+
+            serial_service_name = self._get_active_serial_battery_service()
+            if serial_service_name:
+                logging.info(f"Forcing Charge & Discharge Off on {serial_service_name}...")
+                self._set_dbus_value(serial_service_name, "/Settings/ForceDischargingOff", 1)
+                self._set_dbus_value(serial_service_name, "/Settings/ForceChargingOff", 1)
+
             time.sleep(2)
 
-            # 2. Pre-Disable Hooks (Dynamically find Serial BMS name)
-            if "serialbattery" in old_service:
-                serial_service_name = self._get_active_serial_battery_service()
-                if serial_service_name:
-                    logging.info(f"Setting ForceCharge/Discharge Off for {serial_service_name}...")
-                    self._set_dbus_value(serial_service_name, "/Settings/ForceChargingOff", 1)
-
-            # 3. Disable Current Service
+            # 2. Disable Current BMS Service
             if os.access(self.disable_cmd, os.X_OK):
                 logging.info(f"Disabling {old_service}...")
                 subprocess.run([self.disable_cmd, old_service], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
                 logging.error(f"Error: {self.disable_cmd} not executable or missing.")
 
-            # 4. Post-Disable Hooks (CAN BMS)
+            # 3. Post-Disable Hooks (CAN BMS Shutdown Frame)
             if "canbattery" in old_service:
                 interface = old_service.split(".")[-1]
                 logging.info(f"Sending shutdown frame to {interface}...")
                 subprocess.run(["cansend", interface, "440#00000000"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-            # 5. Swap Symlink
+            # 4. Swap Symlink Profile Target
             try:
                 if os.path.lexists(self.bms_target):
                     os.remove(self.bms_target)
@@ -274,14 +273,14 @@ class BmsSwitcherService:
             except Exception as e:
                 logging.error(f"Failed to update symlink: {e}")
 
-            # 6. Enable Target Service
+            # 5. Enable Target Service
             if os.access(self.enable_cmd, os.X_OK):
                 logging.info(f"Enabling {new_service}...")
                 subprocess.run([self.enable_cmd, new_service], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
                 logging.error(f"Error: {self.enable_cmd} not executable or missing.")
 
-            # 7. Restart serial-starter if switching to Serial BMS
+            # 6. Restart serial-starter when switching to Serial BMS
             if "serialbattery" in new_service:
                 logging.info("Restarting serial-starter service...")
                 if os.path.exists("/service/serial-starter"):
@@ -295,16 +294,17 @@ class BmsSwitcherService:
                         break
                     time.sleep(1)
 
-                if serial_service_name:
-                    logging.info(f"Re-enabling Charge and Discharge on {serial_service_name}...")
-                    self._set_dbus_value(serial_service_name, "/Settings/ForceChargingOff", 0)
-
             time.sleep(2)
 
-            # 8. Restore DVCC Current Limits (-1.0 resets limits in Victron DVCC)
-            logging.info("Re-enabling DC Bus current limits on DVCC...")
+            # 7. Restore DVCC & BMS Current Control
+            serial_service_name = self._get_active_serial_battery_service()
+            if serial_service_name:
+                logging.info(f"Re-enabling Charge & Discharge on {serial_service_name}...")
+                self._set_dbus_value(serial_service_name, "/Settings/ForceDischargingOff", 0)
+                self._set_dbus_value(serial_service_name, "/Settings/ForceChargingOff", 0)
+
+            logging.info("Re-enabling DC Bus charge current limits on DVCC...")
             self._set_dbus_value("com.victronenergy.settings", "/Settings/SystemSetup/MaxChargeCurrent", -1.0)
-            self._set_dbus_value("com.victronenergy.settings", "/Settings/SystemSetup/MaxDischargeCurrent", -1.0)
 
             logging.info("Seamless BMS Pass-Through Switch Complete.")
 
