@@ -42,10 +42,10 @@ class BmsSwitcherService:
         config = self._getConfig()
 
         self.base_path = config['DEFAULT'].get('SERIALBATTERY_BASE_PATH', '/data/apps').strip().rstrip('/')
-        
+
         raw_min = config['DEFAULT'].get('MIN_SOC', '').strip()
         raw_max = config['DEFAULT'].get('MAX_SOC', '85.0').strip()
-        
+
         self.min_soc = float(raw_min) if raw_min else None
         self.max_soc = float(raw_max) if raw_max else 85.0
         self.soc_source = "Config" if (self.min_soc is not None or raw_min) else "Default"
@@ -78,13 +78,13 @@ class BmsSwitcherService:
         self._dbusservice.add_path('/Connected', 1)
 
         # Settings
-        self._dbusservice.add_path('/Settings/BmsSwitcher/MinSoc', 
-                                   self.min_soc if self.min_soc is not None else -1.0, 
-                                   writeable=True, 
+        self._dbusservice.add_path('/Settings/BmsSwitcher/MinSoc',
+                                   self.min_soc if self.min_soc is not None else -1.0,
+                                   writeable=True,
                                    onchangecallback=self._handle_min_soc_change)
-        self._dbusservice.add_path('/Settings/BmsSwitcher/MaxSoc', 
-                                   self.max_soc, 
-                                   writeable=True, 
+        self._dbusservice.add_path('/Settings/BmsSwitcher/MaxSoc',
+                                   self.max_soc,
+                                   writeable=True,
                                    onchangecallback=self._handle_max_soc_change)
         self._dbusservice.add_path('/Settings/BmsSwitcher/SocLimitSource', self.soc_source, writeable=True)
 
@@ -121,7 +121,7 @@ class BmsSwitcherService:
                 logging.error(f"Error reading configuration file {config_file}: {e}")
         else:
             logging.info("No configuration file found. Using default paths and SOC limits.")
-            
+
         return config
 
     def _handle_min_soc_change(self, path, value):
@@ -176,7 +176,7 @@ class BmsSwitcherService:
         try:
             obj = self.bus.get_object(service_name, path)
             iface = dbus.Interface(obj, "com.victronenergy.BusItem")
-            
+
             if isinstance(value, float):
                 dbus_val = dbus.Double(value)
             elif isinstance(value, int):
@@ -274,7 +274,7 @@ class BmsSwitcherService:
         self.is_busy = True
         try:
             current_real_path = os.path.realpath(self.bms_target) if os.path.exists(self.bms_target) else ""
-            
+
             if current_real_path == self.bms_config_a:
                 new_profile = self.bms_config_b
                 old_service = SERVICE_A
@@ -354,31 +354,33 @@ class BmsSwitcherService:
             if serial_service_name:
                 logging.info(f"Re-enabling Charge & Discharge on {serial_service_name}...")
 
-                max_attempts = 15
+                max_attempts = 5
                 verification_success = False
 
                 for attempt in range(1, max_attempts + 1):
-                    # Attempt to apply the settings
+                    # Nominal strategy: Attempt to enable by setting to 0
                     self._set_dbus_value(serial_service_name, "/Settings/ForceDischargingOff", 0)
                     self._set_dbus_value(serial_service_name, "/Settings/ForceChargingOff", 0)
+                    time.sleep(2) # Pause for the driver to broadcast new limits
 
                     # Monitor the actual operational state of the BMS
                     allow_charge = self._get_dbus_value(serial_service_name, "/Io/AllowToCharge")
                     allow_discharge = self._get_dbus_value(serial_service_name, "/Io/AllowToDischarge")
-                    max_charge = self._get_dbus_value(serial_service_name, "/Info/MaxChargeCurrent")
-                    max_discharge = self._get_dbus_value(serial_service_name, "/Info/MaxDischargeCurrent")
 
-                    # Verify both boolean flags are 1 and current limits are greater than 0
-                    if allow_charge == 1 and allow_discharge == 1 and max_charge > 0 and max_discharge > 0:
-                        logging.info(f"BMS confirmed Charge/Discharge is active on attempt {attempt} (CCL: {max_charge}A, DCL: {max_discharge}A).")
+                    # Verify both boolean flags are 1 (Allowed)
+                    if allow_charge == 1 and allow_discharge == 1:
+                        logging.info(f"BMS confirmed Charge/Discharge is active on attempt {attempt}.")
                         verification_success = True
                         break
 
-                    logging.info(f"Attempt {attempt}/{max_attempts}: BMS still blocking (AllowC:{allow_charge}, AllowD:{allow_discharge}, CCL:{max_charge}, DCL:{max_discharge}). Waiting 2s...")
-                    time.sleep(2)
+                    # On failure: Log the issue and apply the reset to 1 before the next iteration
+                    logging.info(f"Attempt {attempt}/{max_attempts}: BMS still blocking (AllowC:{allow_charge}, AllowD:{allow_discharge}). Resetting flags to 1 to force state machine update...")
+                    self._set_dbus_value(serial_service_name, "/Settings/ForceDischargingOff", 1)
+                    self._set_dbus_value(serial_service_name, "/Settings/ForceChargingOff", 1)
+                    time.sleep(1) # Pause for the driver to process the reset state
 
                 if not verification_success:
-                    logging.error(f"Failed to verify active Charge/Discharge state after {max_attempts * 2} seconds.")
+                    logging.error(f"Failed to verify active Charge/Discharge state after {max_attempts} attempts.")
 
             logging.info("Re-enabling DC Bus charge current limits on DVCC...")
             self._set_dbus_value("com.victronenergy.settings", "/Settings/SystemSetup/MaxChargeCurrent", -1.0)
