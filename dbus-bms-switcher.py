@@ -395,15 +395,15 @@ class BmsSwitcherService:
 
                 logging.info("Waiting for Serial BMS to appear on D-Bus...")
                 serial_service_name = None
-                for attempt in range(1, 31):  # Increased timeout to 30 seconds
+                for attempt in range(1, 21):
                     serial_service_name = self._get_active_serial_battery_service()
                     if serial_service_name:
                         logging.info(f"Found Serial BMS {serial_service_name} on D-Bus.")
                         break
-                    time.sleep(1)
+                    time.sleep(attempt)
 
                 if not serial_service_name:
-                    logging.error("Timeout: Serial BMS service failed to register on D-Bus within 30 seconds.")
+                    logging.error("Timeout: Serial BMS service failed to register on D-Bus in time.")
 
             time.sleep(2)
 
