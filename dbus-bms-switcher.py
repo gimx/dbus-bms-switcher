@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import sys
 import time
@@ -20,6 +21,10 @@ SERVICE_NAME = "com.victronenergy.bmsswitcher"
 
 SERVICE_A = "/service/dbus-canbattery.can0"
 SERVICE_B = "/service/dbus-serialbattery.ttyUSB0"
+
+# Exact configured D-Bus service names corresponding to SERVICE_A and SERVICE_B
+DBUS_SERVICE_A = "com.victronenergy.battery.can0"
+DBUS_SERVICE_B = "com.victronenergy.battery.ttyUSB0"
 
 
 def get_git_version():
@@ -200,13 +205,9 @@ class BmsSwitcherService:
             logging.warning(f"Could not set {path} on {service_name}: {e}")
             return False
 
-    def _get_active_serial_battery_service(self):
-        """Dynamically discovers any active dbus-serialbattery service instance."""
-        for name in self.bus.list_names():
-            name_str = str(name)
-            if name_str.startswith("com.victronenergy.battery.tty") or name_str.startswith("com.victronenergy.battery.serial"):
-                return name_str
-        return None
+    def _is_service_on_dbus(self, dbus_service_name):
+        """Checks if a specifically configured D-Bus service name is currently registered."""
+        return dbus_service_name in [str(name) for name in self.bus.list_names()]
 
     def _check_soc_thresholds(self):
         """Monitors SOC and prevents continuous switchover loops when both batteries are low/high."""
@@ -333,11 +334,15 @@ class BmsSwitcherService:
                 new_profile = self.bms_config_b
                 old_service = SERVICE_A
                 new_service = SERVICE_B
+                old_dbus_service = DBUS_SERVICE_A
+                target_dbus_service = DBUS_SERVICE_B
                 transition = "CAN -> Serial"
             else:
                 new_profile = self.bms_config_a
                 old_service = SERVICE_B
                 new_service = SERVICE_A
+                old_dbus_service = DBUS_SERVICE_B
+                target_dbus_service = DBUS_SERVICE_A
                 transition = "Serial -> CAN"
 
             logging.info(f"Detected profile: {current_real_path or 'Unknown/Missing'}")
@@ -350,11 +355,10 @@ class BmsSwitcherService:
             logging.info("Isolating DC Bus: Setting DVCC Max Charge Current to 0A...")
             self._set_dbus_value("com.victronenergy.settings", "/Settings/SystemSetup/MaxChargeCurrent", 0.0)
 
-            serial_service_name = self._get_active_serial_battery_service()
-            if serial_service_name:
-                logging.info(f"Forcing Charge & Discharge Off on {serial_service_name}...")
-                self._set_dbus_value(serial_service_name, "/Settings/ForceDischargingOff", 1)
-                self._set_dbus_value(serial_service_name, "/Settings/ForceChargingOff", 1)
+            if "serialbattery" in old_service and self._is_service_on_dbus(old_dbus_service):
+                logging.info(f"Forcing Charge & Discharge Off on {old_dbus_service}...")
+                self._set_dbus_value(old_dbus_service, "/Settings/ForceDischargingOff", 1)
+                self._set_dbus_value(old_dbus_service, "/Settings/ForceChargingOff", 1)
 
             time.sleep(2)
 
@@ -387,43 +391,40 @@ class BmsSwitcherService:
             else:
                 logging.error(f"Error: {self.enable_cmd} not executable or missing.")
 
-            # 6. Restart serial-starter when switching to Serial BMS
+            # 6. Service-specific hooks & D-Bus wait specifically for configured target BMS
             if "serialbattery" in new_service:
                 logging.info("Restarting serial-starter service...")
                 if os.path.exists("/service/serial-starter"):
                     subprocess.run(["svc", "-t", "/service/serial-starter"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-                logging.info("Waiting for Serial BMS to appear on D-Bus...")
-                serial_service_name = None
-                for attempt in range(1, 21):
-                    serial_service_name = self._get_active_serial_battery_service()
-                    if serial_service_name:
-                        logging.info(f"Found Serial BMS {serial_service_name} on D-Bus.")
-                        break
-                    time.sleep(attempt)
+            logging.info(f"Waiting for configured target BMS ({target_dbus_service}) to appear on D-Bus...")
+            target_found = False
+            for attempt in range(1, 21):
+                if self._is_service_on_dbus(target_dbus_service):
+                    logging.info(f"Found configured target BMS {target_dbus_service} on D-Bus.")
+                    target_found = True
+                    break
+                time.sleep(attempt)
 
-                if not serial_service_name:
-                    logging.error("Timeout: Serial BMS service failed to register on D-Bus in time.")
+            if not target_found:
+                logging.error(f"Timeout: Configured target BMS service ({target_dbus_service}) failed to register on D-Bus in time.")
 
             time.sleep(2)
 
             # 7. Restore DVCC & BMS Current Control
-            serial_service_name = self._get_active_serial_battery_service()
-            if serial_service_name:
-                logging.info(f"Re-enabling Charge & Discharge on {serial_service_name}...")
+            if target_found and "serialbattery" in new_service:
+                logging.info(f"Re-enabling Charge & Discharge on {target_dbus_service}...")
 
                 max_attempts = 2
                 verification_success = False
 
                 for attempt in range(1, max_attempts + 1):
-                    # Nominal strategy: Attempt to enable by setting to 0
-                    self._set_dbus_value(serial_service_name, "/Settings/ForceDischargingOff", 0)
-                    self._set_dbus_value(serial_service_name, "/Settings/ForceChargingOff", 0)
-                    time.sleep(20)  # Pause for driver to broadcast new limits
+                    self._set_dbus_value(target_dbus_service, "/Settings/ForceDischargingOff", 0)
+                    self._set_dbus_value(target_dbus_service, "/Settings/ForceChargingOff", 0)
+                    time.sleep(30)  # Pause for driver to broadcast new limits
 
-                    # Monitor actual operational state of the BMS
-                    allow_charge = self._get_dbus_value(serial_service_name, "/Io/AllowToCharge")
-                    allow_discharge = self._get_dbus_value(serial_service_name, "/Io/AllowToDischarge")
+                    allow_charge = self._get_dbus_value(target_dbus_service, "/Io/AllowToCharge")
+                    allow_discharge = self._get_dbus_value(target_dbus_service, "/Io/AllowToDischarge")
 
                     if allow_charge == 1 and allow_discharge == 1:
                         logging.info(f"BMS confirmed Charge/Discharge is active on attempt {attempt}.")
@@ -431,16 +432,14 @@ class BmsSwitcherService:
                         break
 
                     logging.info(f"Attempt {attempt}/{max_attempts}: BMS still blocking (AllowC:{allow_charge}, AllowD:{allow_discharge}). Resetting flags to 1...")
-                    self._set_dbus_value(serial_service_name, "/Settings/ForceDischargingOff", 1)
-                    self._set_dbus_value(serial_service_name, "/Settings/ForceChargingOff", 1)
-                    time.sleep(20)
+                    self._set_dbus_value(target_dbus_service, "/Settings/ForceDischargingOff", 1)
+                    self._set_dbus_value(target_dbus_service, "/Settings/ForceChargingOff", 1)
+                    time.sleep(10)
 
                 if not verification_success:
                     logging.error(f"Failed to verify active Charge/Discharge state after {max_attempts} attempts.")
-
-                    #Even if unsuccessful leave in the desired state
-                    self._set_dbus_value(serial_service_name, "/Settings/ForceDischargingOff", 0)
-                    self._set_dbus_value(serial_service_name, "/Settings/ForceChargingOff", 0)
+            elif target_found and "canbattery" in new_service:
+                logging.info(f"Configured CAN BMS ({target_dbus_service}) verified active on D-Bus.")
 
             logging.info("Re-enabling DC Bus charge current limits on DVCC...")
             self._set_dbus_value("com.victronenergy.settings", "/Settings/SystemSetup/MaxChargeCurrent", -1.0)
