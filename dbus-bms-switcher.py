@@ -203,7 +203,6 @@ class BmsSwitcherService:
         if self.is_busy:
             return True
 
-        # Corrected D-Bus path for battery SOC
         soc = self._get_dbus_value("com.victronenergy.system", "/Dc/Battery/Soc")
         soc_limit = self._get_dbus_value("com.victronenergy.system", "/Control/ActiveSocLimit")
         battery_power = self._get_dbus_value("com.victronenergy.system", "/Dc/Battery/Power")
@@ -241,26 +240,26 @@ class BmsSwitcherService:
             if (now - self.last_auto_switch_time) < self.COOLDOWN_SECONDS:
                 return True
 
-            # Discharging Logic
-            if power_val < -10 and target_min_limit is not None:
+            # Discharging Logic (Trigger if SOC <= limit AND not actively charging >10W)
+            if power_val <= 10 and target_min_limit is not None:
                 if soc_val <= target_min_limit:
                     if self.last_auto_switch_reason == "LOW_SOC":
                         logging.warning(f"Both battery banks are low ({soc_val:.1f}% <= {target_min_limit:.1f}%). Loop prevented.")
                     else:
                         reason_msg = f"Low SOC threshold reached ({soc_val:.1f}% <= {target_min_limit:.1f}%)"
-                        logging.info(f"Auto-switch triggered (Discharging): {reason_msg}")
+                        logging.info(f"Auto-switch triggered (Discharging/Idle): {reason_msg}")
                         self.last_auto_switch_reason = "LOW_SOC"
                         self.last_auto_switch_time = now
                         self._dbusservice['/LastSwitchReason'] = reason_msg
                         self._handle_trigger_switch('/TriggerSwitch', 1)
 
-            # Charging Logic
-            elif power_val > 10 and soc_val >= target_max_limit:
+            # Charging Logic (Trigger if SOC >= limit AND not actively discharging >10W)
+            elif power_val >= -10 and soc_val >= target_max_limit:
                 if self.last_auto_switch_reason == "HIGH_SOC":
                     logging.warning(f"Both battery banks are full ({soc_val:.1f}% >= {target_max_limit:.1f}%). Loop prevented.")
                 else:
                     reason_msg = f"High SOC threshold reached ({soc_val:.1f}% >= {target_max_limit:.1f}%)"
-                    logging.info(f"Auto-switch triggered (Charging): {reason_msg}")
+                    logging.info(f"Auto-switch triggered (Charging/Idle): {reason_msg}")
                     self.last_auto_switch_reason = "HIGH_SOC"
                     self.last_auto_switch_time = now
                     self._dbusservice['/LastSwitchReason'] = reason_msg
