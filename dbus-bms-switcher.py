@@ -207,7 +207,10 @@ class BmsSwitcherService:
         soc_limit = self._get_dbus_value("com.victronenergy.system", "/Control/ActiveSocLimit")
         battery_power = self._get_dbus_value("com.victronenergy.system", "/Dc/Battery/Power")
 
+        # Type Guard: Prevent TypeError by ignoring None or empty dbus.Array([]) during BMS transitions
         if soc is None or battery_power is None:
+            return True
+        if isinstance(soc, dbus.Array) or isinstance(battery_power, dbus.Array):
             return True
 
         try:
