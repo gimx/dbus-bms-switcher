@@ -353,8 +353,32 @@ class BmsSwitcherService:
             serial_service_name = self._get_active_serial_battery_service()
             if serial_service_name:
                 logging.info(f"Re-enabling Charge & Discharge on {serial_service_name}...")
-                self._set_dbus_value(serial_service_name, "/Settings/ForceDischargingOff", 0)
-                self._set_dbus_value(serial_service_name, "/Settings/ForceChargingOff", 0)
+
+                max_attempts = 15
+                verification_success = False
+
+                for attempt in range(1, max_attempts + 1):
+                    # Attempt to apply the settings
+                    self._set_dbus_value(serial_service_name, "/Settings/ForceDischargingOff", 0)
+                    self._set_dbus_value(serial_service_name, "/Settings/ForceChargingOff", 0)
+
+                    # Monitor the actual operational state of the BMS
+                    allow_charge = self._get_dbus_value(serial_service_name, "/Io/AllowToCharge")
+                    allow_discharge = self._get_dbus_value(serial_service_name, "/Io/AllowToDischarge")
+                    max_charge = self._get_dbus_value(serial_service_name, "/Info/MaxChargeCurrent")
+                    max_discharge = self._get_dbus_value(serial_service_name, "/Info/MaxDischargeCurrent")
+
+                    # Verify both boolean flags are 1 and current limits are greater than 0
+                    if allow_charge == 1 and allow_discharge == 1 and max_charge > 0 and max_discharge > 0:
+                        logging.info(f"BMS confirmed Charge/Discharge is active on attempt {attempt} (CCL: {max_charge}A, DCL: {max_discharge}A).")
+                        verification_success = True
+                        break
+
+                    logging.info(f"Attempt {attempt}/{max_attempts}: BMS still blocking (AllowC:{allow_charge}, AllowD:{allow_discharge}, CCL:{max_charge}, DCL:{max_discharge}). Waiting 2s...")
+                    time.sleep(2)
+
+                if not verification_success:
+                    logging.error(f"Failed to verify active Charge/Discharge state after {max_attempts * 2} seconds.")
 
             logging.info("Re-enabling DC Bus charge current limits on DVCC...")
             self._set_dbus_value("com.victronenergy.settings", "/Settings/SystemSetup/MaxChargeCurrent", -1.0)
