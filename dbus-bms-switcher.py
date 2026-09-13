@@ -412,14 +412,14 @@ class BmsSwitcherService:
             if serial_service_name:
                 logging.info(f"Re-enabling Charge & Discharge on {serial_service_name}...")
 
-                max_attempts = 5
+                max_attempts = 2
                 verification_success = False
 
                 for attempt in range(1, max_attempts + 1):
                     # Nominal strategy: Attempt to enable by setting to 0
                     self._set_dbus_value(serial_service_name, "/Settings/ForceDischargingOff", 0)
                     self._set_dbus_value(serial_service_name, "/Settings/ForceChargingOff", 0)
-                    time.sleep(2)  # Pause for driver to broadcast new limits
+                    time.sleep(20)  # Pause for driver to broadcast new limits
 
                     # Monitor actual operational state of the BMS
                     allow_charge = self._get_dbus_value(serial_service_name, "/Io/AllowToCharge")
@@ -433,10 +433,14 @@ class BmsSwitcherService:
                     logging.info(f"Attempt {attempt}/{max_attempts}: BMS still blocking (AllowC:{allow_charge}, AllowD:{allow_discharge}). Resetting flags to 1...")
                     self._set_dbus_value(serial_service_name, "/Settings/ForceDischargingOff", 1)
                     self._set_dbus_value(serial_service_name, "/Settings/ForceChargingOff", 1)
-                    time.sleep(1)
+                    time.sleep(20)
 
                 if not verification_success:
                     logging.error(f"Failed to verify active Charge/Discharge state after {max_attempts} attempts.")
+
+                    #Even if unsuccessful leave in the desired state
+                    self._set_dbus_value(serial_service_name, "/Settings/ForceDischargingOff", 0)
+                    self._set_dbus_value(serial_service_name, "/Settings/ForceChargingOff", 0)
 
             logging.info("Re-enabling DC Bus charge current limits on DVCC...")
             self._set_dbus_value("com.victronenergy.settings", "/Settings/SystemSetup/MaxChargeCurrent", -1.0)
