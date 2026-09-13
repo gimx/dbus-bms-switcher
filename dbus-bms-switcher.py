@@ -89,6 +89,7 @@ class BmsSwitcherService:
         self._dbusservice.add_path('/Settings/BmsSwitcher/SocLimitSource', self.soc_source, writeable=True)
 
         # Status & Control Paths (Non-settings)
+        self._dbusservice.add_path('/ActiveMinSoc', -1.0)
         self._dbusservice.add_path('/LastSwitchReason', 'None', writeable=True)
         self._dbusservice.add_path('/TriggerSwitch', 0, writeable=True, onchangecallback=self._handle_trigger_switch)
 
@@ -157,9 +158,9 @@ class BmsSwitcherService:
         if int(value) == 1:
             if self.is_busy:
                 logging.warning("Switch transition already in progress. Request ignored.")
+                self._dbusservice['/TriggerSwitch'] = 0
                 return False
             threading.Thread(target=self._execute_switch_process, daemon=True).start()
-            self._dbusservice['/TriggerSwitch'] = 0
             return True
         return True
 
@@ -202,7 +203,8 @@ class BmsSwitcherService:
         if self.is_busy:
             return True
 
-        soc = self._get_dbus_value("com.victronenergy.system", "/Dc/Soc")
+        # Corrected D-Bus path for battery SOC
+        soc = self._get_dbus_value("com.victronenergy.system", "/Dc/Battery/Soc")
         soc_limit = self._get_dbus_value("com.victronenergy.system", "/Control/ActiveSocLimit")
         battery_power = self._get_dbus_value("com.victronenergy.system", "/Dc/Battery/Power")
 
@@ -220,6 +222,9 @@ class BmsSwitcherService:
                 target_min_limit = float(soc_limit) + 5.0
             else:
                 target_min_limit = None
+
+            # Publish currently active minimum SOC threshold to D-Bus
+            self._dbusservice['/ActiveMinSoc'] = float(target_min_limit) if target_min_limit is not None else -1.0
 
             target_max_limit = float(self.max_soc)
 
@@ -357,7 +362,11 @@ class BmsSwitcherService:
 
             logging.info("Seamless BMS Pass-Through Switch Complete.")
 
+        except Exception as e:
+            logging.error(f"Error during execution of switch process: {e}")
         finally:
+            # Reset trigger back to 0 upon completion of switch process
+            self._dbusservice['/TriggerSwitch'] = 0
             self.is_busy = False
 
 
