@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import os
 import sys
 import time
@@ -98,6 +97,17 @@ class BmsSwitcherService:
         self.last_auto_switch_reason = None
         self.last_auto_switch_time = 0
         self.COOLDOWN_SECONDS = 900  # 15-minute minimum cooldown between auto-switches
+
+        # Cache last-known SOC per battery profile at disconnect time
+        self.bms_soc_cache = {
+            SERVICE_A: None,
+            SERVICE_B: None
+        }
+
+        # Settling delay & power debouncing tracking
+        self.post_switch_settle_time = 0
+        self.power_samples = []
+        self.SETTLE_DELAY_SECONDS = 60  # 60-second stabilization delay post-switch
 
         # Register the D-Bus service
         self._dbusservice.register()
@@ -203,6 +213,12 @@ class BmsSwitcherService:
         if self.is_busy:
             return True
 
+        now = time.time()
+
+        # 1. Post-switch stabilization delay (ignores MPPT/Inverter probing pulses)
+        if (now - self.post_switch_settle_time) < self.SETTLE_DELAY_SECONDS:
+            return True
+
         soc = self._get_dbus_value("com.victronenergy.system", "/Dc/Battery/Soc")
         soc_limit = self._get_dbus_value("com.victronenergy.system", "/Control/ActiveSocLimit")
         battery_power = self._get_dbus_value("com.victronenergy.system", "/Dc/Battery/Power")
@@ -215,8 +231,26 @@ class BmsSwitcherService:
 
         try:
             soc_val = float(soc)
-            power_val = float(battery_power)
-            now = time.time()
+            raw_power = float(battery_power)
+
+            # Identify currently active profile service vs target service
+            current_real_path = os.path.realpath(self.bms_target) if os.path.exists(self.bms_target) else ""
+            if current_real_path == self.bms_config_a:
+                active_service = SERVICE_A
+                target_service = SERVICE_B
+            else:
+                active_service = SERVICE_B
+                target_service = SERVICE_A
+
+            # Continuously preserve current active battery's last-known SOC in local cache
+            self.bms_soc_cache[active_service] = soc_val
+
+            # 2. Debounce power readings using rolling average over 3 cycles (30s)
+            self.power_samples.append(raw_power)
+            if len(self.power_samples) > 3:
+                self.power_samples.pop(0)
+
+            avg_power = sum(self.power_samples) / len(self.power_samples)
 
             if self.min_soc is not None:
                 target_min_limit = float(self.min_soc)
@@ -227,7 +261,6 @@ class BmsSwitcherService:
 
             # Publish currently active minimum SOC threshold to D-Bus
             self._dbusservice['/ActiveMinSoc'] = float(target_min_limit) if target_min_limit is not None else -1.0
-
             target_max_limit = float(self.max_soc)
 
             # Hysteresis resets
@@ -243,26 +276,44 @@ class BmsSwitcherService:
             if (now - self.last_auto_switch_time) < self.COOLDOWN_SECONDS:
                 return True
 
-            # Discharging Logic (Trigger if SOC <= limit AND not actively charging >10W)
-            if power_val <= 10 and target_min_limit is not None:
+            # 3. Discharging Logic (Requires sustained discharge <= -50W)
+            if avg_power <= -50 and target_min_limit is not None:
                 if soc_val <= target_min_limit:
                     if self.last_auto_switch_reason == "LOW_SOC":
                         logging.warning(f"Both battery banks are low ({soc_val:.1f}% <= {target_min_limit:.1f}%). Loop prevented.")
                     else:
+                        # Check target battery's cached SOC at last disconnect
+                        cached_target_soc = self.bms_soc_cache.get(target_service)
+                        if cached_target_soc is not None and cached_target_soc <= target_min_limit:
+                            logging.warning(
+                                f"Target battery ({target_service}) was depleted at last disconnect "
+                                f"({cached_target_soc:.1f}% <= {target_min_limit:.1f}%). Switch aborted."
+                            )
+                            return True
+
                         reason_msg = f"Low SOC threshold reached ({soc_val:.1f}% <= {target_min_limit:.1f}%)"
-                        logging.info(f"Auto-switch triggered (Discharging/Idle): {reason_msg}")
+                        logging.info(f"Auto-switch triggered (Discharging): {reason_msg}")
                         self.last_auto_switch_reason = "LOW_SOC"
                         self.last_auto_switch_time = now
                         self._dbusservice['/LastSwitchReason'] = reason_msg
                         self._handle_trigger_switch('/TriggerSwitch', 1)
 
-            # Charging Logic (Trigger if SOC >= limit AND not actively discharging >10W)
-            elif power_val >= -10 and soc_val >= target_max_limit:
+            # 4. Charging Logic (Requires sustained charge >= 50W)
+            elif avg_power >= 50 and soc_val >= target_max_limit:
                 if self.last_auto_switch_reason == "HIGH_SOC":
                     logging.warning(f"Both battery banks are full ({soc_val:.1f}% >= {target_max_limit:.1f}%). Loop prevented.")
                 else:
+                    # Check target battery's cached SOC at last disconnect
+                    cached_target_soc = self.bms_soc_cache.get(target_service)
+                    if cached_target_soc is not None and cached_target_soc >= target_max_limit:
+                        logging.warning(
+                            f"Target battery ({target_service}) was full at last disconnect "
+                            f"({cached_target_soc:.1f}% >= {target_max_limit:.1f}%). Switch aborted."
+                        )
+                        return True
+
                     reason_msg = f"High SOC threshold reached ({soc_val:.1f}% >= {target_max_limit:.1f}%)"
-                    logging.info(f"Auto-switch triggered (Charging/Idle): {reason_msg}")
+                    logging.info(f"Auto-switch triggered (Charging): {reason_msg}")
                     self.last_auto_switch_reason = "HIGH_SOC"
                     self.last_auto_switch_time = now
                     self._dbusservice['/LastSwitchReason'] = reason_msg
@@ -344,11 +395,15 @@ class BmsSwitcherService:
 
                 logging.info("Waiting for Serial BMS to appear on D-Bus...")
                 serial_service_name = None
-                for _ in range(15):
+                for attempt in range(1, 31):  # Increased timeout to 30 seconds
                     serial_service_name = self._get_active_serial_battery_service()
                     if serial_service_name:
+                        logging.info(f"Found Serial BMS {serial_service_name} on D-Bus.")
                         break
                     time.sleep(1)
+
+                if not serial_service_name:
+                    logging.error("Timeout: Serial BMS service failed to register on D-Bus within 30 seconds.")
 
             time.sleep(2)
 
@@ -364,23 +419,21 @@ class BmsSwitcherService:
                     # Nominal strategy: Attempt to enable by setting to 0
                     self._set_dbus_value(serial_service_name, "/Settings/ForceDischargingOff", 0)
                     self._set_dbus_value(serial_service_name, "/Settings/ForceChargingOff", 0)
-                    time.sleep(2) # Pause for the driver to broadcast new limits
+                    time.sleep(2)  # Pause for driver to broadcast new limits
 
-                    # Monitor the actual operational state of the BMS
+                    # Monitor actual operational state of the BMS
                     allow_charge = self._get_dbus_value(serial_service_name, "/Io/AllowToCharge")
                     allow_discharge = self._get_dbus_value(serial_service_name, "/Io/AllowToDischarge")
 
-                    # Verify both boolean flags are 1 (Allowed)
                     if allow_charge == 1 and allow_discharge == 1:
                         logging.info(f"BMS confirmed Charge/Discharge is active on attempt {attempt}.")
                         verification_success = True
                         break
 
-                    # On failure: Log the issue and apply the reset to 1 before the next iteration
-                    logging.info(f"Attempt {attempt}/{max_attempts}: BMS still blocking (AllowC:{allow_charge}, AllowD:{allow_discharge}). Resetting flags to 1 to force state machine update...")
+                    logging.info(f"Attempt {attempt}/{max_attempts}: BMS still blocking (AllowC:{allow_charge}, AllowD:{allow_discharge}). Resetting flags to 1...")
                     self._set_dbus_value(serial_service_name, "/Settings/ForceDischargingOff", 1)
                     self._set_dbus_value(serial_service_name, "/Settings/ForceChargingOff", 1)
-                    time.sleep(1) # Pause for the driver to process the reset state
+                    time.sleep(1)
 
                 if not verification_success:
                     logging.error(f"Failed to verify active Charge/Discharge state after {max_attempts} attempts.")
@@ -393,8 +446,10 @@ class BmsSwitcherService:
         except Exception as e:
             logging.error(f"Error during execution of switch process: {e}")
         finally:
-            # Reset trigger back to 0 upon completion of switch process
+            # Reset trigger back to 0, start stabilization delay, and clear power queue
             self._dbusservice['/TriggerSwitch'] = 0
+            self.post_switch_settle_time = time.time()
+            self.power_samples.clear()
             self.is_busy = False
 
 
