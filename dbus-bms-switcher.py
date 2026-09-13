@@ -421,7 +421,7 @@ class BmsSwitcherService:
                 for attempt in range(1, max_attempts + 1):
                     self._set_dbus_value(target_dbus_service, "/Settings/ForceDischargingOff", 0)
                     self._set_dbus_value(target_dbus_service, "/Settings/ForceChargingOff", 0)
-                    time.sleep(30)  # Pause for driver to broadcast new limits
+                    time.sleep(40)  # Pause for driver to broadcast new limits
 
                     allow_charge = self._get_dbus_value(target_dbus_service, "/Io/AllowToCharge")
                     allow_discharge = self._get_dbus_value(target_dbus_service, "/Io/AllowToDischarge")
@@ -438,8 +438,10 @@ class BmsSwitcherService:
 
                 if not verification_success:
                     logging.error(f"Failed to verify active Charge/Discharge state after {max_attempts} attempts.")
-            elif target_found and "canbattery" in new_service:
-                logging.info(f"Configured CAN BMS ({target_dbus_service}) verified active on D-Bus.")
+
+                    #Even if unsuccessful leave in the desired state
+                    self._set_dbus_value(serial_service_name, "/Settings/ForceDischargingOff", 0)
+                    self._set_dbus_value(serial_service_name, "/Settings/ForceChargingOff", 0)
 
             elif target_found and "canbattery" in new_service:
                 logging.info(f"Configured CAN BMS ({target_dbus_service}) verified active on D-Bus.")
