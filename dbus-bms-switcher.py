@@ -32,7 +32,7 @@ def get_git_version():
     try:
         script_dir = os.path.dirname(os.path.realpath(__file__))
         return subprocess.check_output(
-            ["git", "describe", "--always", "--dirty"],
+            ["git", "describe", "--tags", "--always", "--dirty"],
             cwd=script_dir,
             stderr=subprocess.DEVNULL
         ).decode('utf-8').strip()
@@ -307,7 +307,7 @@ class BmsSwitcherService:
                     # Check target battery's cached SOC at last disconnect
                     cached_target_soc = self.bms_soc_cache.get(target_service)
                     if cached_target_soc is not None and cached_target_soc >= target_max_limit:
-                        logging.warning(
+                        logging.debug(
                             f"Target battery ({target_service}) was full at last disconnect "
                             f"({cached_target_soc:.1f}% >= {target_max_limit:.1f}%). Switch aborted."
                         )
@@ -440,8 +440,8 @@ class BmsSwitcherService:
                     logging.error(f"Failed to verify active Charge/Discharge state after {max_attempts} attempts.")
 
                     #Even if unsuccessful leave in the desired state
-                    self._set_dbus_value(serial_service_name, "/Settings/ForceDischargingOff", 0)
-                    self._set_dbus_value(serial_service_name, "/Settings/ForceChargingOff", 0)
+                    self._set_dbus_value(target_dbus_service, "/Settings/ForceDischargingOff", 0)
+                    self._set_dbus_value(target_dbus_service, "/Settings/ForceChargingOff", 0)
 
             elif target_found and "canbattery" in new_service:
                 logging.info(f"Configured CAN BMS ({target_dbus_service}) verified active on D-Bus.")
