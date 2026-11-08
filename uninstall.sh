@@ -1,5 +1,7 @@
 #!/bin/bash
 
+SCRIPT_DIR=$(cd $(dirname $0) && pwd)
+source "$SCRIPT_DIR/gui-v1-cleanup.sh"
 DATA_DIR="/data/dbus-bms-switcher"
 SERVICE_DIR="/service/dbus-bms-switcher"
 APP_AVAILABLE_DIR="/data/apps/available/BmsSwitcher"
@@ -30,5 +32,8 @@ if [ -e "$APP_ENABLED_LINK" ] || [ -L "$APP_ENABLED_LINK" ]; then
     if [ -d "/service/gui" ]; then guiService="/service/gui"; else guiService="/service/start-gui"; fi
     [ -d "$guiService" ] && svc -t "$guiService"
 fi
+
+# 4. Remove the GUI v1 pages of earlier installs
+remove_gui_v1_pages
 
 echo "Uninstall complete. Application files remain in $DATA_DIR (incl. config.ini); delete manually if no longer needed."

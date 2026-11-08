@@ -4,7 +4,7 @@ SCRIPT_DIR=$(cd $(dirname $0) && pwd)
 DATA_DIR="/data/dbus-bms-switcher"
 SERVICE_DIR="/service/dbus-bms-switcher"
 LOG_DIR="/var/log/dbus-bms-switcher"
-QML_DIR="/opt/victronenergy/gui/qml"
+source "$SCRIPT_DIR/gui-v1-cleanup.sh"
 
 echo "Do install"
 
@@ -30,18 +30,10 @@ if [ -f "$DATA_DIR/service/log/run" ]; then
     chmod +x $DATA_DIR/service/log/run
 fi
 
-# 5. Handle QML GUI Integration
-if [ -f "$QML_DIR/PageSettings.qml" ]; then
-    if grep -Fq "PageBmsSwitcher" $QML_DIR/PageSettings.qml; then
-        echo "GUI menu already in PageSettings.qml"
-    else
-        echo "GUI menu not found, adding QML overlay..."
-        if [ -d "$SCRIPT_DIR/qml" ]; then
-            cp -rf $SCRIPT_DIR/qml/* $QML_DIR/
-        fi
-        svc -t /service/gui
-    fi
-fi
+# 5. Remove the GUI v1 pages of earlier installs. They replaced PageSettings.qml and imported
+#    QtQuick 1.1, which is not available on Venus OS v3.x, so GUI v1 failed to load at all.
+#    The gui-v2 UI plugin below replaces them.
+remove_gui_v1_pages
 
 # 5b. gui-v2 UI plugin (Settings -> Integrations -> UI Plugins -> BmsSwitcher)
 #     Works on the local display and in the remote console / VRM; no Victron files are modified.
