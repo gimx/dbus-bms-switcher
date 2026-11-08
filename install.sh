@@ -43,6 +43,39 @@ if [ -f "$QML_DIR/PageSettings.qml" ]; then
     fi
 fi
 
+# 5b. gui-v2 UI plugin (Settings -> Integrations -> UI Plugins -> BmsSwitcher)
+#     Works on the local display and in the remote console / VRM; no Victron files are modified.
+PLUGIN_JSON="$SCRIPT_DIR/gui-v2/BmsSwitcher/BmsSwitcher.json"
+APP_AVAILABLE_DIR="/data/apps/available/BmsSwitcher"
+APP_ENABLED_LINK="/data/apps/enabled/BmsSwitcher"
+# NOTE: dbus-flashmq (remote console / VRM) requires <app-dir>/gui-v2/<app-dir>.json, so the app dir must be "BmsSwitcher".
+if [ -L "/data/apps/enabled/dbus-bms-switcher" ]; then
+    echo "Removing plugin from earlier install with wrong app directory name..."
+    rm -f "/data/apps/enabled/dbus-bms-switcher"
+    rm -rf "/data/apps/available/dbus-bms-switcher"
+fi
+if [ -f "$PLUGIN_JSON" ]; then
+    mkdir -p "$APP_AVAILABLE_DIR/gui-v2" /data/apps/enabled
+    if ! cmp -s "$PLUGIN_JSON" "$APP_AVAILABLE_DIR/gui-v2/BmsSwitcher.json"; then
+        echo "Installing gui-v2 UI plugin..."
+        cp -f "$PLUGIN_JSON" "$APP_AVAILABLE_DIR/gui-v2/BmsSwitcher.json"
+        pluginChanged=1
+    else
+        echo "gui-v2 UI plugin already up to date"
+    fi
+    if [ ! -e "$APP_ENABLED_LINK" ]; then
+        ln -s "$APP_AVAILABLE_DIR" "$APP_ENABLED_LINK"
+        pluginChanged=1
+    fi
+    if [ "$pluginChanged" = "1" ]; then
+        if [ -d "/service/gui" ]; then guiService="/service/gui"; else guiService="/service/start-gui"; fi
+        if [ -d "$guiService" ]; then
+            echo "Restarting GUI to load the plugin..."
+            svc -t "$guiService"
+        fi
+    fi
+fi
+
 # 6. Link service directory to /service for daemontools
 if [ ! -d "$SERVICE_DIR" ] && [ ! -L "$SERVICE_DIR" ]; then
     echo "Linking service to /service..."
