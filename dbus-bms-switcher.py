@@ -27,6 +27,19 @@ SERVICE_B = "/service/dbus-serialbattery.ttyUSB0"
 DBUS_SERVICE_A = "com.victronenergy.battery.can0"
 DBUS_SERVICE_B = "com.victronenergy.battery.ttyUSB0"
 
+# Alarms of the active BMS that trigger a switch to the standby BMS (critical, reported by most BMSes).
+# Values on D-Bus: 0 = OK, 1 = warning, 2 = alarm, None = not supported by the BMS.
+ALARM_PATHS = [
+    "/Alarms/HighVoltage",
+    "/Alarms/LowVoltage",
+    "/Alarms/HighCellVoltage",
+    "/Alarms/LowCellVoltage",
+    "/Alarms/HighTemperature",
+    "/Alarms/LowTemperature",
+]
+ALARM_LEVEL = 2               # only real alarms trigger, warnings are just reported
+ALARM_DEBOUNCE_SECONDS = 30   # alarm must persist this long before switching
+
 
 def get_git_version():
     """Executes git describe to fetch the current git tag/hash of the file directory."""
@@ -54,6 +67,9 @@ class BmsSwitcherService:
         self.min_soc = float(raw_min) if raw_min else None
         self.max_soc = float(raw_max) if raw_max else 85.0
         self.soc_source = "Config" if (self.min_soc is not None or raw_min) else "Default"
+
+        raw_alarm_switch = config['DEFAULT'].get('ALARM_SWITCH', '1').strip()
+        self.alarm_switch_enabled = raw_alarm_switch not in ('0', 'false', 'False', 'no', 'off')
 
         # Derived paths
         self.bms_config_a = os.path.join(self.base_path, "dbus-serialbattery/config.ubms.ini")
@@ -92,6 +108,10 @@ class BmsSwitcherService:
                                    writeable=True,
                                    onchangecallback=self._handle_max_soc_change)
         self._dbusservice.add_path('/Settings/BmsSwitcher/SocLimitSource', self.soc_source, writeable=True)
+        self._dbusservice.add_path('/Settings/BmsSwitcher/AlarmSwitch',
+                                   1 if self.alarm_switch_enabled else 0,
+                                   writeable=True,
+                                   onchangecallback=self._handle_alarm_switch_change)
 
         # Status & Control Paths (Non-settings)
         self._dbusservice.add_path('/ActiveMinSoc', -1.0)
@@ -105,6 +125,8 @@ class BmsSwitcherService:
         self._dbusservice.add_path('/ActiveBmsName', self._display_name(active_service))
         self._dbusservice.add_path('/StandbyBmsName', self._display_name(standby_service))
         self._dbusservice.add_path('/Busy', 0)
+        self._dbusservice.add_path('/ActiveBmsAlarms', '')
+        self._dbusservice.add_path('/StandbyAlarmAtDisconnect', 0)
 
         # Operational state & anti-flip-flop tracking
         self.is_busy = False
@@ -117,6 +139,14 @@ class BmsSwitcherService:
             SERVICE_A: None,
             SERVICE_B: None
         }
+
+        # Alarm state per battery profile: True if it was in alarm while last active (loop guard)
+        self.bms_alarm_flag = {
+            SERVICE_A: False,
+            SERVICE_B: False
+        }
+        self.alarm_since = None
+        self.alarm_block_logged = False
 
         # Settling delay & power debouncing tracking
         self.post_switch_settle_time = 0
@@ -135,7 +165,6 @@ class BmsSwitcherService:
         config_file = os.path.join(os.path.dirname(os.path.realpath(__file__)), "config.ini")
         if not os.path.exists(config_file):
             config_file = "/data/apps/dbus-bmsswitcher/config.ini"
-        self.config_file = config_file
 
         if os.path.exists(config_file):
             logging.info(f"Loading service configuration from: {config_file}")
@@ -149,38 +178,9 @@ class BmsSwitcherService:
 
         return config
 
-    def _persist_setting(self, key, value):
-        """Write a single KEY = value line back to config.ini so D-Bus/GUI changes survive restarts.
-        Comments and other lines are preserved; the key is appended if not present."""
-        try:
-            lines = []
-            if os.path.exists(self.config_file):
-                with open(self.config_file, 'r') as f:
-                    lines = f.readlines()
-
-            new_line = f"{key} = {value}\n"
-            for i, line in enumerate(lines):
-                stripped = line.strip()
-                if stripped.startswith((';', '#')):
-                    continue
-                if stripped.split('=', 1)[0].strip().upper() == key:
-                    lines[i] = new_line
-                    break
-            else:
-                if lines and not lines[-1].endswith('\n'):
-                    lines[-1] += '\n'
-                lines.append(new_line)
-
-            tmp_file = self.config_file + ".tmp"
-            with open(tmp_file, 'w') as f:
-                f.writelines(lines)
-            os.replace(tmp_file, self.config_file)
-            logging.info(f"Persisted {key} = {value} to {self.config_file}")
-        except Exception as e:
-            logging.error(f"Could not persist {key} to {self.config_file}: {e}")
-
     def _handle_min_soc_change(self, path, value):
-        """Callback executed when MinSoc is updated over D-Bus (e.g. from the GUI). Negative = dynamic."""
+        """Callback executed when MinSoc is updated over D-Bus (e.g. from the GUI). Negative = dynamic.
+        Runtime only: config.ini stays the fallback after a restart."""
         try:
             val = float(value)
         except (ValueError, TypeError) as e:
@@ -190,14 +190,12 @@ class BmsSwitcherService:
         if val < 0:
             self.min_soc = None
             logging.info("MinSoc set to dynamic mode (< 0) via D-Bus.")
-            self._persist_setting('MIN_SOC', '')
         else:
             if val > 100 or val >= self.max_soc:
                 logging.warning(f"Rejected MinSoc {val}%: must be within 0..100 and below MaxSoc ({self.max_soc}%).")
                 return False
             self.min_soc = val
             logging.info(f"MinSoc updated via D-Bus to: {self.min_soc}%")
-            self._persist_setting('MIN_SOC', f"{val:.1f}")
 
         self._dbusservice['/Settings/BmsSwitcher/SocLimitSource'] = "D-Bus"
         return True
@@ -217,9 +215,86 @@ class BmsSwitcherService:
 
         self.max_soc = val
         logging.info(f"MaxSoc updated via D-Bus to: {self.max_soc}%")
-        self._persist_setting('MAX_SOC', f"{val:.1f}")
 
         self._dbusservice['/Settings/BmsSwitcher/SocLimitSource'] = "D-Bus"
+        return True
+
+    def _handle_alarm_switch_change(self, path, value):
+        """Callback executed when the alarm-triggered switch is enabled/disabled over D-Bus (e.g. from the GUI)."""
+        try:
+            enabled = int(value) == 1
+        except (ValueError, TypeError):
+            logging.error(f"Invalid AlarmSwitch value received: {value}")
+            return False
+        self.alarm_switch_enabled = enabled
+        self.alarm_since = None
+        logging.info(f"Alarm-triggered switching {'enabled' if enabled else 'disabled'} via D-Bus.")
+        return True
+
+    def _check_alarms(self, now):
+        """Reads the monitored alarms of the active BMS, keeps the per-BMS alarm flag up to date and
+        triggers a switch on a persistent alarm. Bypasses the SOC cooldown, but never switches to a BMS
+        that was in alarm when it was left. Returns True if a switch was triggered."""
+        active_service, _ = self._get_active_profile()
+        target_service = SERVICE_B if active_service == SERVICE_A else SERVICE_A
+        active_dbus = DBUS_SERVICE_A if active_service == SERVICE_A else DBUS_SERVICE_B
+
+        alarms, warnings = [], []
+        if self._is_service_on_dbus(active_dbus):
+            for path in ALARM_PATHS:
+                value = self._get_dbus_value(active_dbus, path)
+                if value is None or isinstance(value, dbus.Array):
+                    continue
+                try:
+                    level = int(value)
+                except (ValueError, TypeError):
+                    continue
+                name = path.rsplit('/', 1)[-1]
+                if level >= ALARM_LEVEL:
+                    alarms.append(name)
+                elif level >= 1:
+                    warnings.append(name)
+
+        summary = ", ".join([f"{a} (alarm)" for a in alarms] + [f"{w} (warning)" for w in warnings])
+        if self._dbusservice['/ActiveBmsAlarms'] != summary:
+            self._dbusservice['/ActiveBmsAlarms'] = summary
+        if summary:
+            logging.debug(f"Active BMS alarms: {summary}")
+
+        # Remember whether the active BMS is in alarm; the value at switch-over time is kept as loop guard.
+        self.bms_alarm_flag[active_service] = bool(alarms)
+        standby_flag = 1 if self.bms_alarm_flag[target_service] else 0
+        if self._dbusservice['/StandbyAlarmAtDisconnect'] != standby_flag:
+            self._dbusservice['/StandbyAlarmAtDisconnect'] = standby_flag
+
+        if not alarms:
+            if self.alarm_since is not None:
+                logging.info("BMS alarm cleared before switch-over.")
+            self.alarm_since = None
+            self.alarm_block_logged = False
+            return False
+
+        if self.alarm_since is None:
+            self.alarm_since = now
+            logging.warning(f"BMS alarm on {self._display_name(active_service)}: {', '.join(alarms)}")
+        if not self.alarm_switch_enabled or (now - self.alarm_since) < ALARM_DEBOUNCE_SECONDS:
+            return False
+
+        if self.bms_alarm_flag[target_service]:
+            if not self.alarm_block_logged:
+                logging.warning(
+                    f"Standby BMS ({self._display_name(target_service)}) was in alarm when it was last active. "
+                    f"Alarm switch aborted to prevent a loop; switch manually if it has recovered.")
+                self.alarm_block_logged = True
+            return False
+
+        reason_msg = f"Alarm on {self._display_name(active_service)}: {', '.join(alarms)}"
+        logging.info(f"Auto-switch triggered (Alarm): {reason_msg}")
+        self.last_auto_switch_reason = "ALARM"
+        self.last_auto_switch_time = now
+        self.alarm_since = None
+        self._dbusservice['/LastSwitchReason'] = reason_msg
+        self._handle_trigger_switch('/TriggerSwitch', 1)
         return True
 
     def _get_active_profile(self):
@@ -338,6 +413,13 @@ class BmsSwitcherService:
         if (now - self.post_switch_settle_time) < self.SETTLE_DELAY_SECONDS:
             return True
 
+        # 2. Alarm-triggered switch (independent of SOC, bypasses the SOC cooldown)
+        try:
+            if self._check_alarms(now):
+                return True
+        except Exception as e:
+            logging.error(f"Error processing BMS alarm logic: {e}")
+
         soc = self._get_dbus_value("com.victronenergy.system", "/Dc/Battery/Soc")
         soc_limit = self._get_dbus_value("com.victronenergy.system", "/Control/ActiveSocLimit")
         battery_power = self._get_dbus_value("com.victronenergy.system", "/Dc/Battery/Power")
@@ -393,6 +475,10 @@ class BmsSwitcherService:
                 self.last_auto_switch_reason = None
 
             if (now - self.last_auto_switch_time) < self.COOLDOWN_SECONDS:
+                return True
+
+            # Never auto-switch to a BMS that was in alarm when it was left
+            if self.bms_alarm_flag.get(target_service):
                 return True
 
             # 3. Discharging Logic (Requires sustained discharge <= -50W)

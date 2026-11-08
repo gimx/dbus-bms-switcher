@@ -26,6 +26,7 @@ Page {
 	VeQuickItem { id: maxSocItem; uid: root.serviceUid + "/Settings/BmsSwitcher/MaxSoc" }
 	VeQuickItem { id: activeMinSocItem; uid: root.serviceUid + "/ActiveMinSoc" }
 	VeQuickItem { id: triggerItem; uid: root.serviceUid + "/TriggerSwitch" }
+	VeQuickItem { id: standbyAlarmItem; uid: root.serviceUid + "/StandbyAlarmAtDisconnect" }
 
 	GradientListView {
 		model: VisibleItemModel {
@@ -129,6 +130,31 @@ Page {
 				}
 				to: 100
 				stepSize: 1
+			}
+
+			SettingsListHeader {
+				text: "Alarm trigger"
+				preferredVisible: root.serviceOnline
+			}
+
+			ListSwitch {
+				text: "Switch on BMS alarm"
+				secondaryText: "Voltage, cell voltage or temperature alarm for 30 s"
+				dataItem.uid: root.serviceUid + "/Settings/BmsSwitcher/AlarmSwitch"
+				preferredVisible: dataItem.valid
+			}
+
+			ListText {
+				text: "Active BMS alarms"
+				dataItem.uid: root.serviceUid + "/ActiveBmsAlarms"
+				secondaryText: dataItem.valid && dataItem.value !== "" ? dataItem.value : "None"
+				preferredVisible: dataItem.valid
+			}
+
+			ListText {
+				text: "Standby BMS"
+				secondaryText: "Was in alarm when left - no auto switch back"
+				preferredVisible: standbyAlarmItem.valid && standbyAlarmItem.value === 1
 			}
 
 			SettingsListHeader {
