@@ -1,0 +1,3 @@
+gui-v2/.gui-v2-plugin-compiler-*.py
+__pycache__/
+bms-names.json

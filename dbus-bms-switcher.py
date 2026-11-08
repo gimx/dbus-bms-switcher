@@ -6,6 +6,7 @@ import logging
 import subprocess
 import threading
 import configparser
+import json
 import platform
 from gi.repository import GLib
 
@@ -96,6 +97,14 @@ class BmsSwitcherService:
         self._dbusservice.add_path('/ActiveMinSoc', -1.0)
         self._dbusservice.add_path('/LastSwitchReason', 'None', writeable=True)
         self._dbusservice.add_path('/TriggerSwitch', 0, writeable=True, onchangecallback=self._handle_trigger_switch)
+        self.bms_names_file = os.path.join(os.path.dirname(os.path.realpath(__file__)), "bms-names.json")
+        self.bms_names = self._load_bms_names()
+        active_service, active_label = self._get_active_profile()
+        standby_service = SERVICE_B if active_service == SERVICE_A else SERVICE_A
+        self._dbusservice.add_path('/ActiveBms', active_label)
+        self._dbusservice.add_path('/ActiveBmsName', self._display_name(active_service))
+        self._dbusservice.add_path('/StandbyBmsName', self._display_name(standby_service))
+        self._dbusservice.add_path('/Busy', 0)
 
         # Operational state & anti-flip-flop tracking
         self.is_busy = False
@@ -126,6 +135,7 @@ class BmsSwitcherService:
         config_file = os.path.join(os.path.dirname(os.path.realpath(__file__)), "config.ini")
         if not os.path.exists(config_file):
             config_file = "/data/apps/dbus-bmsswitcher/config.ini"
+        self.config_file = config_file
 
         if os.path.exists(config_file):
             logging.info(f"Loading service configuration from: {config_file}")
@@ -139,35 +149,141 @@ class BmsSwitcherService:
 
         return config
 
+    def _persist_setting(self, key, value):
+        """Write a single KEY = value line back to config.ini so D-Bus/GUI changes survive restarts.
+        Comments and other lines are preserved; the key is appended if not present."""
+        try:
+            lines = []
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r') as f:
+                    lines = f.readlines()
+
+            new_line = f"{key} = {value}\n"
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped.startswith((';', '#')):
+                    continue
+                if stripped.split('=', 1)[0].strip().upper() == key:
+                    lines[i] = new_line
+                    break
+            else:
+                if lines and not lines[-1].endswith('\n'):
+                    lines[-1] += '\n'
+                lines.append(new_line)
+
+            tmp_file = self.config_file + ".tmp"
+            with open(tmp_file, 'w') as f:
+                f.writelines(lines)
+            os.replace(tmp_file, self.config_file)
+            logging.info(f"Persisted {key} = {value} to {self.config_file}")
+        except Exception as e:
+            logging.error(f"Could not persist {key} to {self.config_file}: {e}")
+
     def _handle_min_soc_change(self, path, value):
-        """Callback executed when MinSoc is updated over D-Bus."""
+        """Callback executed when MinSoc is updated over D-Bus (e.g. from the GUI). Negative = dynamic."""
         try:
             val = float(value)
-            if val < 0:
-                self.min_soc = None
-                logging.info("MinSoc set to dynamic mode (< 0) via D-Bus.")
-            else:
-                self.min_soc = val
-                logging.info(f"MinSoc updated via D-Bus to: {self.min_soc}%")
-
-            self._dbusservice['/Settings/BmsSwitcher/SocLimitSource'] = "D-Bus"
-            return True
         except (ValueError, TypeError) as e:
             logging.error(f"Invalid MinSoc value received: {value} ({e})")
             return False
 
+        if val < 0:
+            self.min_soc = None
+            logging.info("MinSoc set to dynamic mode (< 0) via D-Bus.")
+            self._persist_setting('MIN_SOC', '')
+        else:
+            if val > 100 or val >= self.max_soc:
+                logging.warning(f"Rejected MinSoc {val}%: must be within 0..100 and below MaxSoc ({self.max_soc}%).")
+                return False
+            self.min_soc = val
+            logging.info(f"MinSoc updated via D-Bus to: {self.min_soc}%")
+            self._persist_setting('MIN_SOC', f"{val:.1f}")
+
+        self._dbusservice['/Settings/BmsSwitcher/SocLimitSource'] = "D-Bus"
+        return True
+
     def _handle_max_soc_change(self, path, value):
-        """Callback executed when MaxSoc is updated over D-Bus."""
+        """Callback executed when MaxSoc is updated over D-Bus (e.g. from the GUI)."""
         try:
             val = float(value)
-            self.max_soc = val
-            logging.info(f"MaxSoc updated via D-Bus to: {self.max_soc}%")
-
-            self._dbusservice['/Settings/BmsSwitcher/SocLimitSource'] = "D-Bus"
-            return True
         except (ValueError, TypeError) as e:
             logging.error(f"Invalid MaxSoc value received: {value} ({e})")
             return False
+
+        effective_min = self.min_soc if self.min_soc is not None else self._dbusservice['/ActiveMinSoc']
+        if val <= 0 or val > 100 or (effective_min is not None and effective_min >= 0 and val <= effective_min):
+            logging.warning(f"Rejected MaxSoc {val}%: must be within 0..100 and above MinSoc ({effective_min}%).")
+            return False
+
+        self.max_soc = val
+        logging.info(f"MaxSoc updated via D-Bus to: {self.max_soc}%")
+        self._persist_setting('MAX_SOC', f"{val:.1f}")
+
+        self._dbusservice['/Settings/BmsSwitcher/SocLimitSource'] = "D-Bus"
+        return True
+
+    def _get_active_profile(self):
+        """Returns (active_service, label) based on where the serialbattery config.ini symlink points."""
+        current_real_path = os.path.realpath(self.bms_target) if os.path.exists(self.bms_target) else ""
+        if current_real_path == self.bms_config_a:
+            return SERVICE_A, "CAN (" + os.path.basename(self.bms_config_a) + ")"
+        if current_real_path == self.bms_config_b:
+            return SERVICE_B, "Serial (" + os.path.basename(self.bms_config_b) + ")"
+        return SERVICE_B, "Unknown"
+
+    def _load_bms_names(self):
+        """Last-known device names per BMS. The standby BMS driver is disabled and therefore not on
+        D-Bus, so its name can only come from this cache (persisted across restarts)."""
+        names = {SERVICE_A: None, SERVICE_B: None}
+        try:
+            with open(self.bms_names_file, 'r') as f:
+                stored = json.load(f)
+            for service in names:
+                if isinstance(stored.get(service), str) and stored[service]:
+                    names[service] = stored[service]
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logging.warning(f"Could not read BMS name cache {self.bms_names_file}: {e}")
+        return names
+
+    def _save_bms_names(self):
+        try:
+            tmp_file = self.bms_names_file + ".tmp"
+            with open(tmp_file, 'w') as f:
+                json.dump(self.bms_names, f, indent=2)
+            os.replace(tmp_file, self.bms_names_file)
+        except Exception as e:
+            logging.warning(f"Could not write BMS name cache {self.bms_names_file}: {e}")
+
+    def _read_device_name(self, dbus_service_name):
+        """Device name as shown by Venus OS: CustomName if set, otherwise ProductName."""
+        for path in ('/CustomName', '/ProductName'):
+            value = self._get_dbus_value(dbus_service_name, path)
+            if value is not None and not isinstance(value, dbus.Array) and str(value).strip():
+                return str(value).strip()
+        return None
+
+    def _display_name(self, service):
+        return self.bms_names.get(service) or "Unknown"
+
+    def _publish_active_bms(self):
+        active_service, label = self._get_active_profile()
+        standby_service = SERVICE_B if active_service == SERVICE_A else SERVICE_A
+
+        # Refresh the cached name of the active BMS while its driver is on D-Bus
+        dbus_name = DBUS_SERVICE_A if active_service == SERVICE_A else DBUS_SERVICE_B
+        name = self._read_device_name(dbus_name)
+        if name and name != self.bms_names.get(active_service):
+            logging.info(f"Device name of {active_service}: {name}")
+            self.bms_names[active_service] = name
+            self._save_bms_names()
+
+        for path, value in (('/ActiveBms', label),
+                            ('/ActiveBmsName', self._display_name(active_service)),
+                            ('/StandbyBmsName', self._display_name(standby_service))):
+            if self._dbusservice[path] != value:
+                self._dbusservice[path] = value
 
     def _handle_trigger_switch(self, path, value):
         if int(value) == 1:
@@ -213,6 +329,8 @@ class BmsSwitcherService:
         """Monitors SOC and prevents continuous switchover loops when both batteries are low/high."""
         if self.is_busy:
             return True
+
+        self._publish_active_bms()
 
         now = time.time()
 
@@ -327,6 +445,7 @@ class BmsSwitcherService:
 
     def _execute_switch_process(self):
         self.is_busy = True
+        self._dbusservice['/Busy'] = 1
         try:
             current_real_path = os.path.realpath(self.bms_target) if os.path.exists(self.bms_target) else ""
 
@@ -459,6 +578,8 @@ class BmsSwitcherService:
             self.post_switch_settle_time = time.time()
             self.power_samples.clear()
             self.is_busy = False
+            self._dbusservice['/Busy'] = 0
+            self._publish_active_bms()
 
 
 if __name__ == "__main__":
