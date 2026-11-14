@@ -429,6 +429,10 @@ class BmsSwitcherService:
             return True
         if isinstance(soc, dbus.Array) or isinstance(battery_power, dbus.Array):
             return True
+        # ActiveSocLimit is invalid (empty array) while the VE.Bus system is not (yet) available,
+        # e.g. after a restart of mk2-dbus: then only the configured min_soc applies
+        if isinstance(soc_limit, dbus.Array):
+            soc_limit = None
 
         try:
             soc_val = float(soc)
